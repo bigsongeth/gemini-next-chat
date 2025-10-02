@@ -30,6 +30,11 @@ function checkToken(token: string): boolean {
 }
 
 export function middleware(request: NextRequest) {
+  // Skip token validation if no password is set
+  if (password === '') {
+    return NextResponse.next()
+  }
+
   for (const proxyRoute of proxyRoutes) {
     if (request.nextUrl.pathname.startsWith(proxyRoute)) {
       const contentLength = request.headers.get('Content-Length')
@@ -52,7 +57,7 @@ export function middleware(request: NextRequest) {
       }
     }
   }
-  if (request.nextUrl.pathname.startsWith('/api/google/v1beta/models/')) {
+  if (request.nextUrl.pathname.startsWith('/api/google/v1beta/openai')) {
     const token = request.headers.get('X-Goog-Api-Key')
     if (isNull(token) || !checkToken(token)) {
       return NextResponse.json({ code: 40301, message: ErrorType.InValidToken }, { status: 403 })

@@ -1,23 +1,13 @@
-import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@xiangfa/generative-ai'
-import type {
-  InlineDataPart,
-  ModelParams,
-  Tool,
-  ToolConfig,
-  Part,
-  SafetySetting,
-  GenerationConfig,
-} from '@xiangfa/generative-ai'
-import { getVisionPrompt, getFunctionCallPrompt } from '@/utils/prompt'
-import { hasUploadFiles, getRandomKey } from '@/utils/common'
-import { OldVisionModel, DefaultModel } from '@/constant/model'
-import { isUndefined } from 'lodash-es'
+import type { InlineDataPart, Tool } from '@xiangfa/generative-ai'
+import { DefaultModel } from '@/constant/model'
+import { OPENROUTER_API_BASE_URL } from '@/constant/urls'
+import { hasUploadFiles } from '@/utils/common'
+import type { OpenAIChatCompletionChunk, OpenAIChatCompletionMessage, OpenAITool } from '@/utils/openaiTypes'
 
 export type RequestProps = {
   model?: string
   systemInstruction?: string
   tools?: Tool[]
-  toolConfig?: ToolConfig
   messages: Message[]
   apiKey: string
   baseUrl?: string
@@ -30,163 +20,196 @@ export type RequestProps = {
   safety: string
 }
 
-export type NewModelParams = ModelParams & {
-  tools?: Array<Tool | { googleSearch: {} } | { codeExecution: {} }>
-  safetySettings?: SafetySetting[] & Array<{ category: string; threshold: string }>
-}
+const OPENROUTER_BASE_PATH = '/v1'
 
-export function getSafetySettings(level: string) {
-  let threshold: HarmBlockThreshold
-  switch (level) {
-    case 'none':
-      threshold = HarmBlockThreshold.BLOCK_NONE
-      break
-    case 'low':
-      threshold = HarmBlockThreshold.BLOCK_LOW_AND_ABOVE
-      break
-    case 'middle':
-      threshold = HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE
-      break
-    case 'high':
-      threshold = HarmBlockThreshold.BLOCK_ONLY_HIGH
-      break
-    default:
-      threshold = HarmBlockThreshold.HARM_BLOCK_THRESHOLD_UNSPECIFIED
-      break
+function resolveBaseUrl(baseUrl?: string) {
+  const defaultBase = `${OPENROUTER_API_BASE_URL}${OPENROUTER_BASE_PATH}`
+  if (!baseUrl) return defaultBase
+  const normalized = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl
+
+  if (/(?:\/v\d+(?:beta)?\/openai|\/api\/v\d+|\/openai\/v\d+)$/.test(normalized)) {
+    return normalized
   }
-  return [
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-    HarmCategory.HARM_CATEGORY_HARASSMENT,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-  ].map((category) => {
-    return { category, threshold }
-  })
+
+  if (normalized.endsWith('/chat/completions')) {
+    return normalized.replace(/\/chat\/completions$/, '')
+  }
+
+  if (normalized.endsWith('/api')) {
+    return `${normalized}/v1`
+  }
+
+  return `${normalized}${OPENROUTER_BASE_PATH}`
 }
 
-function canUseSearchAsTool(model: string) {
-  if (model.startsWith('gemini-2.5-pro') || model.startsWith('gemini-2.5-flash')) return true
-  return (
-    model.startsWith('gemini-2.0') && !model.includes('lite') && !model.includes('thinking') && !model.includes('image')
-  )
+function buildOpenAITools(tools: Tool[] = []): OpenAITool[] | undefined {
+  const declarations = tools.flatMap((tool) => tool.functionDeclarations ?? [])
+  if (declarations.length === 0) return undefined
+  return declarations.map((item) => ({
+    type: 'function',
+    function: {
+      name: item.name,
+      description: item.description,
+      parameters: item.parameters ?? { type: 'object', properties: {} },
+    },
+  }))
+}
+
+function convertInlineData(part: InlineDataPart['inlineData']) {
+  if (!part) return undefined
+  return `data:${part.mimeType};base64,${part.data}`
+}
+
+function convertParts(parts: Message['parts']): OpenAIChatCompletionMessage['content'] {
+  const contentParts: NonNullable<OpenAIChatCompletionMessage['content']> = []
+  for (const part of parts) {
+    if (part.text) {
+      contentParts.push({ type: 'text', text: part.text })
+    } else if (part.inlineData) {
+      const dataUrl = convertInlineData(part.inlineData)
+      if (dataUrl) {
+        contentParts.push({ type: 'image_url', image_url: { url: dataUrl } })
+      }
+    }
+  }
+  return contentParts.length > 0 ? contentParts : null
+}
+
+function convertMessages(messages: Message[], systemInstruction?: string): OpenAIChatCompletionMessage[] {
+  const results: OpenAIChatCompletionMessage[] = []
+  if (systemInstruction) {
+    results.push({ role: 'system', content: [{ type: 'text', text: systemInstruction }] })
+  }
+  for (const message of messages) {
+    if (message.role === 'model') {
+      const assistantMessage: OpenAIChatCompletionMessage = {
+        role: 'assistant',
+        content: [],
+      }
+      const toolCalls = []
+      for (const part of message.parts) {
+        if (part.functionCall) {
+          toolCalls.push({
+            id: part.functionCall.name,
+            type: 'function',
+            function: {
+              name: part.functionCall.name,
+              arguments: JSON.stringify(part.functionCall.args ?? {}),
+            },
+          })
+        } else if (part.text) {
+          assistantMessage.content = assistantMessage.content ?? []
+          assistantMessage.content.push({ type: 'text', text: part.text })
+        } else if (part.inlineData) {
+          assistantMessage.content = assistantMessage.content ?? []
+          const dataUrl = convertInlineData(part.inlineData)
+          if (dataUrl) {
+            assistantMessage.content.push({ type: 'image_url', image_url: { url: dataUrl } })
+          }
+        }
+      }
+      if (toolCalls.length > 0) {
+        assistantMessage.tool_calls = toolCalls
+        assistantMessage.content = assistantMessage.content?.length ? assistantMessage.content : null
+      }
+      results.push(assistantMessage)
+      continue
+    }
+    if (message.role === 'function') {
+      for (const part of message.parts) {
+        if (part.functionResponse) {
+          results.push({
+            role: 'tool',
+            tool_call_id: part.functionResponse.name,
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(part.functionResponse.response?.content ?? part.functionResponse.response ?? {}),
+              },
+            ],
+          })
+        }
+      }
+      continue
+    }
+    const role = message.role === 'model' ? 'assistant' : (message.role as OpenAIChatCompletionMessage['role'])
+    const content = convertParts(message.parts)
+    results.push({ role, content: content ?? [{ type: 'text', text: '' }] })
+  }
+  return results
+}
+
+function mapGenerationConfig(generationConfig: RequestProps['generationConfig']) {
+  const { topP, temperature, maxOutputTokens } = generationConfig
+  return {
+    temperature,
+    top_p: topP,
+    max_output_tokens: maxOutputTokens,
+  }
+}
+
+async function* parseChatCompletionsStream(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed || !trimmed.startsWith('data:')) continue
+      const payload = trimmed.slice(5).trim()
+      if (payload === '[DONE]') return
+      try {
+        yield JSON.parse(payload) as OpenAIChatCompletionChunk
+      } catch (error) {
+        // skip malformed chunk
+      }
+    }
+  }
 }
 
 export default async function chat({
   messages = [],
   systemInstruction,
   tools,
-  toolConfig,
   model = DefaultModel,
   apiKey,
   baseUrl,
   generationConfig,
-  safety,
 }: RequestProps) {
-  const genAI = new GoogleGenerativeAI(getRandomKey(apiKey, hasUploadFiles(messages)))
-  const modelParams: NewModelParams = {
+  const url = `${resolveBaseUrl(baseUrl)}/chat/completions`
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`
+    headers['HTTP-Referer'] = 'http://localhost:3000'
+    headers['X-Title'] = 'Gemini Next Chat'
+  }
+  const payload: Record<string, unknown> = {
     model,
-    generationConfig,
-    safetySettings: getSafetySettings(safety),
+    messages: convertMessages(messages, systemInstruction),
+    stream: true,
+    ...mapGenerationConfig(generationConfig),
   }
-  if (systemInstruction) {
-    if (!model.startsWith('gemini-1.0')) {
-      modelParams.systemInstruction = systemInstruction
-    } else {
-      const systemInstructionMessages = [
-        { id: 'systemInstruction', role: 'user', parts: [{ text: systemInstruction }] },
-        { id: 'systemInstruction2', role: 'model', parts: [{ text: 'ok' }] },
-      ]
-      messages = [...systemInstructionMessages, ...messages]
-    }
+  if (hasUploadFiles(messages)) {
+    payload.max_output_tokens = generationConfig.maxOutputTokens
   }
-  if (
-    tools &&
-    !OldVisionModel.includes(model) &&
-    !model.includes('lite') &&
-    !model.includes('thinking') &&
-    !model.includes('image')
-  ) {
-    const toolPrompt = getFunctionCallPrompt()
-    modelParams.tools = tools
-    modelParams.systemInstruction = modelParams.systemInstruction
-      ? `${modelParams.systemInstruction}\n\n${toolPrompt}`
-      : toolPrompt
-    modelParams.generationConfig = {
-      ...generationConfig,
-      temperature: 0,
-    }
-    if (toolConfig) modelParams.toolConfig = toolConfig
+  const toolDeclarations = buildOpenAITools(tools)
+  if (toolDeclarations) {
+    payload.tools = toolDeclarations
   }
-  if (canUseSearchAsTool(model)) {
-    const officialPlugins = [{ googleSearch: {} }]
-    if (!tools) {
-      modelParams.tools = officialPlugins
-    }
-    if (modelParams.safetySettings) {
-      const safetySettings: NewModelParams['safetySettings'] = []
-      modelParams.safetySettings.forEach((item) => {
-        if (safety === 'none') {
-          safetySettings.push({ category: item.category, threshold: 'OFF' })
-        } else {
-          safetySettings.push(item)
-        }
-      })
-      safetySettings.push({
-        category: 'HARM_CATEGORY_CIVIC_INTEGRITY',
-        threshold: HarmBlockThreshold.BLOCK_NONE,
-      })
-      modelParams.safetySettings = safetySettings
-    }
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  })
+  if (!response.ok || !response.body) {
+    const error = await response.text()
+    throw new Error(error || response.statusText)
   }
-  if (model.startsWith('gemini-2.0-flash-exp-image-generation') && modelParams.generationConfig) {
-    modelParams.generationConfig.responseModalities = ['Text', 'Image']
-  }
-  const geminiModel = genAI.getGenerativeModel(modelParams, { baseUrl })
-  const message = messages.pop()
-  if (isUndefined(message)) {
-    throw new Error('Request parameter error')
-  }
-  if (OldVisionModel.includes(model)) {
-    const textMessages: Message[] = []
-    const imageMessages: InlineDataPart[] = message.parts.filter((part) =>
-      part.inlineData?.mimeType.startsWith('image/'),
-    ) as InlineDataPart[]
-    for (const item of messages) {
-      for (const part of item.parts) {
-        if (part.text) {
-          textMessages.push(item)
-        } else if (part.inlineData?.mimeType.startsWith('image/')) {
-          imageMessages.push(part)
-        }
-      }
-    }
-    const prompt = getVisionPrompt(message, textMessages)
-    if (imageMessages.length > 16) {
-      throw new Error('Limited to 16 pictures')
-    }
-    const { stream } = await geminiModel.generateContentStream([prompt, ...imageMessages])
-    return stream
-  } else {
-    const chat = geminiModel.startChat({
-      history: messages.map((item) => {
-        let parts: Part[] = []
-        if (item.role === 'model') {
-          let textPart: Part | null = null
-          for (const part of item.parts) {
-            if (part.text) {
-              textPart = part
-            } else {
-              parts.push(part)
-            }
-          }
-          if (textPart) parts = [textPart, ...parts]
-        } else {
-          parts = item.parts
-        }
-        return { role: item.role, parts }
-      }),
-    })
-    const { stream } = await chat.sendMessageStream(message.parts)
-    return stream
-  }
+  return parseChatCompletionsStream(response.body.getReader())
 }

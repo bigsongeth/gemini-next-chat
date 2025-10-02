@@ -12,7 +12,13 @@ export async function fetchModels(options: Options) {
     const response = await fetch(`/api/models?token=${token}`)
     return response.json()
   } else {
-    const response = await fetch(`${options.apiProxy}/v1beta/models?key=${options.apiKey}`)
+    const response = await fetch(`${options.apiProxy}/v1/models`, {
+      headers: {
+        'Authorization': `Bearer ${options.apiKey}`,
+        'HTTP-Referer': 'http://localhost:3000',
+        'X-Title': 'Gemini Next Chat',
+      }
+    })
     return response.json()
   }
 }
